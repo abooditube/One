@@ -62,7 +62,6 @@ jobs:
       - name: Decode and create keystore
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > TMessagesProj/config/release.keystore
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
 
       - name: Create local properties for signing
         run: |
