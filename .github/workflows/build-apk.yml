@@ -1,0 +1,174 @@
+name: Build APK Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+  JAVA_VERSION: "17"
+  JAVA_DISTRIBUTION: "temurin"
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --licenses << EOF
+          y
+          y
+          y
+          y
+          y
+          y
+          y
+          y
+          EOF
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;21.4.7075529"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Create keystore directory
+        run: mkdir -p TMessagesProj/config
+
+      - name: Decode and create keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > TMessagesProj/config/release.keystore
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+      - name: Create local properties for signing
+        run: |
+          echo "RELEASE_KEY_PASSWORD=${{ secrets.KEYSTORE_PASS }}" >> local.properties
+          echo "RELEASE_KEY_ALIAS=${{ secrets.ALIAS_NAME }}" >> local.properties
+          echo "RELEASE_STORE_PASSWORD=${{ secrets.KEYSTORE_PASS }}" >> local.properties
+
+      - name: Update BuildVars.java with API credentials
+        run: |
+          BUILD_VARS_FILE="TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java"
+          if [ -f "$BUILD_VARS_FILE" ]; then
+            sed -i 's/public static int APP_ID = [0-9]*;/public static int APP_ID = ${{ secrets.TELEGRAM_APP_ID }};/' "$BUILD_VARS_FILE"
+            sed -i 's/public static String APP_HASH = "[^"]*";/public static String APP_HASH = "${{ secrets.TELEGRAM_APP_HASH }}";/' "$BUILD_VARS_FILE"
+            echo "Updated BuildVars.java with API credentials"
+          else
+            echo "BuildVars.java not found"
+            exit 1
+          fi
+
+      - name: Update gradle.properties for signing
+        run: |
+          sed -i 's/RELEASE_KEY_PASSWORD=.*/RELEASE_KEY_PASSWORD=${{ secrets.KEYSTORE_PASS }}/' gradle.properties
+          sed -i 's/RELEASE_KEY_ALIAS=.*/RELEASE_KEY_ALIAS=${{ secrets.ALIAS_NAME }}/' gradle.properties
+          sed -i 's/RELEASE_STORE_PASSWORD=.*/RELEASE_STORE_PASSWORD=${{ secrets.KEYSTORE_PASS }}/' gradle.properties
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: |
+          ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace
+
+      - name: Rename APK files with version info
+        run: |
+          VERSION_NAME=$(grep "APP_VERSION_NAME=" gradle.properties | cut -d'=' -f2)
+          VERSION_CODE=$(grep "APP_VERSION_CODE=" gradle.properties | cut -d'=' -f2)
+          BUILD_DATE=$(date +%Y%m%d_%H%M%S)
+
+          mkdir -p output
+
+          # Find and rename APK files
+          find TMessagesProj_App/build/outputs/apk -name "*.apk" -type f | while read apk; do
+            flavor=$(echo "$apk" | grep -oP '(?<=/)[^/]+(?=/release)')
+            new_name="One_${VERSION_NAME}_${flavor}_${BUILD_DATE}.apk"
+            cp "$apk" "output/$new_name"
+            echo "Renamed: $apk -> output/$new_name"
+          done
+
+          # List output files
+          ls -la output/
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: One-APK-${{ github.run_number }}
+          path: output/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Get APK info
+        id: apk_info
+        run: |
+          VERSION_NAME=$(grep "APP_VERSION_NAME=" gradle.properties | cut -d'=' -f2)
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "APK files to release:"
+          ls -la output/
+
+      - name: Create Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.apk_info.outputs.version_name }}-${{ github.run_number }}
+          name: One v${{ steps.apk_info.outputs.version_name }} Build ${{ github.run_number }}
+          body: |
+            ## One Messenger APK Release
+
+            **Version:** ${{ steps.apk_info.outputs.version_name }}
+            **Build Number:** ${{ github.run_number }}
+            **Commit:** ${{ github.sha }}
+
+            ### Downloads
+            Download the APK files from the assets below.
+
+            ### Build Info
+            - Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            - Branch: ${{ github.ref_name }}
+          files: output/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Notify on build completion
+  notify:
+    name: Notify Build Status
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Build Status
+        run: |
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "✅ Build completed successfully!"
+            echo "APK files are available in the Artifacts and Releases sections."
+          else
+            echo "❌ Build failed!"
+            exit 1
+          fi
